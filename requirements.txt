@@ -1,0 +1,17 @@
+# Utilities
+pandas
+matplotlib
+python-dotenv
+
+# Core Environment & Graphics
+gymnasium
+pygame
+numpy
+
+# Reinforcement Learning & Torch
+torch
+stable-baselines3
+tensorboard
+
+# LLM Integration
+# openai
