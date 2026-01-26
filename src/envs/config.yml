@@ -1,0 +1,18 @@
+# Rewards configuration for Kula World RL Agent
+
+# Step & Movement
+exploration_reward: 0.5   # Reward for arriving at new tiles
+step_penalty: -0.1          # Cost per time step to encourage speed
+# jump_penalty: -0.5          # Extra cost for jumping (energy cost)
+camping_penalty_factor: 0.2 # Multiplier for staying on the same tile
+
+# Interactions
+collect_key: 10.0           # Large reward for primary objective
+collect_coin: 2.0           # Small reward for secondary objective
+level_complete: 50.0        # Massive reward for winning
+exit_without_key: -1.0      # Penalty for trying to leave too early
+
+# Terminal States (Death)
+death_void: -10.0           # Falling off map or into empty space
+death_spike: -10.0          # Hitting a spike
+death_timeout: -10.0        # Running out of time
