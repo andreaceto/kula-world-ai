@@ -1,130 +1,127 @@
 import os
 import sys
+import numpy as np
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnNoModelImprovement
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
-
 from src.envs.kula_env import KulaWorldEnv
 
-# --- CONSTANTS ---
-VERBOSE_LEVEL = 0                # 0=no output, 1=info, 2=debug
-TOTAL_TIMESTEPS = 10_000_000     # Total steps to train
-EVAL_FREQ = 100_000              # Evaluate the agent every X steps
-EVAL_EPISODES = 5                # Average reward over X episodes during evaluation (MUST match the number of seeds below)
-FIXED_SEEDS = [
-    101, 102, 103, 104, 105
-    ]                           # Fixed seeds for evaluation episodes
-PATIENCE = 10                    # Stop training if no improvement after X evaluations
-LEARNING_RATE = 0.0003
+# --- CONFIGURATION ---
+VERBOSE_LEVEL = 0            # 0: No Output, 1: Basic, 2: Detailed
+TOTAL_TIMESTEPS = 10_000_000       
+EVAL_FREQ = 10_000              # How often to test (steps)
+EVAL_EPISODES = 5               # How many times to test per eval
+PROMOTION_THRESHOLD = 30.0      # Reward needed to level up
+LOG_DIR = "logs/curriculum"
+MODELS_DIR = "models/ppo_baseline"
 
-class FixedSeedWrapper(gym.Wrapper):
+class CurriculumManager(BaseCallback):
     """
-    Forces the environment to cycle through a fixed list of seeds on every reset.
-    This ensures evaluation happens on the EXACT same levels every time.
+    A unified callback that manages Evaluation, Saving, and Curriculum updates.
+    Replaces EvalCallback to ensure we have full control over the environment.
     """
-    def __init__(self, env, seeds):
-        super().__init__(env)
-        self.seeds = seeds
-        self.idx = 0
+    def __init__(self, train_env, eval_env, verbose=1):
+        super(CurriculumManager, self).__init__(verbose)
+        self.train_env = train_env
+        self.eval_env = eval_env
+        self.current_level = 0
+        self.max_level = 7
+        self.best_mean_reward = -np.inf
 
-    def reset(self, **kwargs):
-        # Pick the current seed
-        seed_to_use = self.seeds[self.idx]
+    def _on_step(self) -> bool:
+        # Check if it's time to evaluate
+        if self.n_calls % EVAL_FREQ == 0:
+            self._run_evaluation()
+        return True
+
+    def _run_evaluation(self):
+        print(f"\n--- EVALUATION AT STEP {self.num_timesteps} ---")
+        print(f"Current Difficulty Level: {self.current_level}")
         
-        # Inject it into kwargs
-        kwargs['seed'] = seed_to_use
+        # 1. Run Evaluation
+        # We use the built-in evaluate_policy function
+        mean_reward, std_reward = evaluate_policy(
+            self.model, 
+            self.eval_env, 
+            n_eval_episodes=EVAL_EPISODES,
+            deterministic=True
+        )
         
-        # Advance index (loop back to 0 if we finish the list)
-        self.idx = (self.idx + 1) % len(self.seeds)
+        print(f"Result: Mean Reward = {mean_reward:.2f} +/- {std_reward:.2f}")
         
-        return self.env.reset(**kwargs)
+        # 2. Log to Tensorboard
+        self.logger.record("eval/mean_reward", mean_reward)
+        self.logger.record("curriculum/level", self.current_level)
+
+        # 3. Save Best Model
+        if mean_reward > self.best_mean_reward:
+            print("New Best Model! Saving...")
+            self.best_mean_reward = mean_reward
+            self.model.save(f"{MODELS_DIR}/best_model")
+
+        # 4. Check for Promotion
+        if self.current_level < self.max_level:
+            if mean_reward >= PROMOTION_THRESHOLD:
+                self._promote_agent()
+            else:
+                print(f"Status: Failed to pass (Need {PROMOTION_THRESHOLD}). Retrying...")
+        else:
+            if mean_reward >= PROMOTION_THRESHOLD:
+                print("Status: Mastered Final Level.")
+
+    def _promote_agent(self):
+        self.current_level += 1
+        # print(f"\n{'!'*40}")
+        # print(f" PROMOTION! Upgrading to Level {self.current_level}")
+        # print(f"{'!'*40}\n")
+        
+        # A. Update Training Environment
+        self.train_env.unwrapped.set_curriculum_level(self.current_level)
+        
+        # B. Update Evaluation Environment
+        self.eval_env.unwrapped.set_curriculum_level(self.current_level)
+        
+        # Reset to ensure the next episode starts fresh with new logic
+        self.eval_env.reset()
 
 def main():
-    # 1. Setup Directories
-    models_dir = "models/ppo_baseline"
-    log_dir = "logs"
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # 2. Initialize Environments
-    # Training Environment
-    train_env = Monitor(KulaWorldEnv(verbose=VERBOSE_LEVEL, render_mode=None)) 
-    
-    # Evaluation Environment (Separate instance is crucial for accurate testing)
-    base_eval_env = KulaWorldEnv(verbose=VERBOSE_LEVEL, render_mode=None)
-    eval_env = Monitor(FixedSeedWrapper(base_eval_env, seeds=FIXED_SEEDS))
-    
-    # 3. Define Callbacks
-    # A. Checkpoint (Backup every 50k steps regardless of performance)
-    checkpoint_callback = CheckpointCallback(
-        save_freq=EVAL_FREQ,
-        save_path=models_dir, 
-        name_prefix="ppo_kula_backup"
-    )
+    # 1. Initialize Environments
+    # We keep eval_env as a simple Monitor (not Vectorized) so we can control it easily
+    train_env = Monitor(KulaWorldEnv(verbose=VERBOSE_LEVEL))
+    eval_env = Monitor(KulaWorldEnv(verbose=VERBOSE_LEVEL)) # No rendering during automated eval
 
-    # B. Early Stopping Mechanism
-    # Stops training if there is no improvement after PATIENCE * EVAL_FREQ steps
-    stop_train_callback = StopTrainingOnNoModelImprovement(
-        max_no_improvement_evals=PATIENCE, 
-        min_evals=3, 
-        verbose=VERBOSE_LEVEL
-    )
+    # 2. Initialize Manager Callback
+    manager = CurriculumManager(train_env, eval_env)
 
-    # C. Evaluation & Best Model Saver
-    # This triggers the evaluation, saves the "best_model.zip", and checks for early stopping
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=models_dir,
-        log_path=log_dir,
-        eval_freq=EVAL_FREQ,
-        n_eval_episodes=EVAL_EPISODES,
-        deterministic=True,
-        render=False,
-        callback_after_eval=stop_train_callback, # Link early stopping here
-        verbose=VERBOSE_LEVEL
-    )
-
-    # 4. Agent Configuration
+    # 3. Agent
     model = PPO(
         "MultiInputPolicy", 
         train_env, 
         verbose=VERBOSE_LEVEL,
-        tensorboard_log=log_dir,
-        learning_rate=LEARNING_RATE,
+        tensorboard_log=LOG_DIR,
+        learning_rate=0.0003,
         n_steps=2048,
-        batch_size=64,
-        gamma=0.99,
-        ent_coef=0.05,
-        device="auto"
+        ent_coef=0.05
     )
 
-    print(f"--- Starting Training ({TOTAL_TIMESTEPS} steps) ---")
-    print(f"{'='*50}")
-    print(f"TENSORBOARD COMMAND:")
-    print(f"tensorboard --logdir {os.path.abspath(log_dir)}")
-    print(f"{'='*50}\n")
-    
-    try:
-        # Pass the list of callbacks (Checkpoint + Eval/EarlyStop)
-        model.learn(
-            total_timesteps=TOTAL_TIMESTEPS, 
-            callback=[checkpoint_callback, eval_callback]
-        )
-    except KeyboardInterrupt:
-        print("\nTraining interrupted manually. Saving current state...")
+    print("--- STARTING TRAINING ---")
+    print(f"Goal: {TOTAL_TIMESTEPS} steps. Check every {EVAL_FREQ} steps.")
 
-    # 6. Final Save
-    model.save(f"{models_dir}/final_model")
-    print("--- Training Completed ---")
-    print(f"Best model saved to: {models_dir}/best_model.zip")
-    print(f"Final model saved to: {models_dir}/final_model.zip")
-    
-    # Reminder at the end
-    print(f"\nMonitor progress: tensorboard --logdir {log_dir}")
+    try:
+        model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=manager)
+    except KeyboardInterrupt:
+        print("Training interrupted.")
+
+    model.save(f"{MODELS_DIR}/final_model")
+    print("Done.")
 
 if __name__ == "__main__":
     main()
