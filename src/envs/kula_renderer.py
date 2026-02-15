@@ -1,186 +1,295 @@
-import pygame
+from __future__ import annotations
+
 import os
+from typing import Dict, Tuple, Optional, Any
+
+import pygame
 import numpy as np
 
-# Configuration
-TILE_SIZE = 40
-HUD_HEIGHT = 60  # Extra space at the bottom for UI
+
+# Keep tile IDs consistent with env
+VOID  = 0
+FLOOR = 1
+START = 2
+EXIT  = 4
+SPIKE = 5
+KEY   = 6
+COIN  = 7
+
+
+# Direction names for sprites
+DIR_UP = "up"
+DIR_DOWN = "down"
+DIR_LEFT = "left"
+DIR_RIGHT = "right"
+
 
 class KulaRenderer:
-    def __init__(self, width, height, caption="Kula World AI"):
+    """
+    Pygame renderer for KulaWorld.
+
+    Expected render(state) input:
+      state = {
+        "grid": np.ndarray(H,W) ints,
+        "agent_pos": (y,x),
+        "agent_dir": "up"/"down"/"left"/"right"  (optional; default right),
+        "has_key": bool,
+        "step_count": int,
+        "max_steps": int,
+        "score": int|float|None
+      }
+    """
+
+    def __init__(
+        self,
+        assets_dir: str = "assets",
+        tile_px: int = 32,
+        hud_h: int = 60,
+        fps: int = 30,
+        window_caption: str = "Kula World",
+    ):
         pygame.init()
-        pygame.display.set_caption(caption)
-        
-        self.grid_width = width
-        self.grid_height = height
-        self.window_width = width * TILE_SIZE
-        self.window_height = (height * TILE_SIZE) + HUD_HEIGHT
-        
-        self.window = pygame.display.set_mode((self.window_width, self.window_height))
+        pygame.font.init()
+
+        self.assets_dir = assets_dir
+        self.tile_px = int(tile_px)
+        self.hud_h = int(hud_h)
+        self.fps = int(fps)
+
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Arial", 20, bold=True)
-        
-        # --- Asset Loading ---
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(os.path.dirname(current_dir))
-        self.asset_dir = os.path.join(project_root, "assets")
-        # --- Asset Loading ---
-        self.assets = {}
+        self.screen: Optional[pygame.Surface] = None
+        self.caption = window_caption
+
+        # Fonts (keep simple & readable)
+        self.font = pygame.font.SysFont("arial", 20)
+        self.font_small = pygame.font.SysFont("arial", 16)
+
+        # Cache for fallback colored surfaces by key/size
+        self._fallback_cache: Dict[Tuple[str, int, int], pygame.Surface] = {}
+
+        # Asset dicts
+        self.tiles: Dict[str, pygame.Surface] = {}
+        self.items: Dict[str, pygame.Surface] = {}
+        self.player: Dict[str, pygame.Surface] = {}
+        self.hud: Dict[str, pygame.Surface] = {}
+
+        # Load all assets (with safe fallbacks)
         self._load_assets()
 
-    def _load_assets(self):
-        """Loads images using paths relative to the project root."""
-        
-        # Helper to join paths correctly
-        def get_path(category, filename):
-            return os.path.join(self.asset_dir, category, filename)
+        self._last_grid_shape: Optional[Tuple[int, int]] = None
 
-        # Mapping: logical_name -> (full_path, fallback_color)
-        asset_map = {
-            # Player
-            "player_up":    (get_path("player", "player_facing_up.png"), (0, 191, 255)),
-            "player_down":  (get_path("player", "player_facing_down.png"), (0, 191, 255)),
-            "player_left":  (get_path("player", "player_facing_left.png"), (0, 191, 255)),
-            "player_right": (get_path("player", "player_facing_right.png"), (0, 191, 255)),
-            
-            # Items
-            "spike":        (get_path("items", "spikes.png"), (128, 0, 128)),
-            "coin":         (get_path("items", "coin.png"), (255, 255, 0)),
-            "key":          (get_path("items", "key.png"), (255, 215, 0)),
-            
-            # Tiles
-            "floor":        (get_path("tiles", "floor.png"), (200, 200, 200)),
-            "start":        (get_path("tiles", "start.png"), (0, 255, 0)),
-            "exit_locked":  (get_path("tiles", "exit_locked.png"), (255, 0, 0)),
-            "exit_open":    (get_path("tiles", "exit_unlocked.png"), (0, 0, 255)),
-            
-            # HUD
-            "hud_heart":       (get_path("hud", "hud_heart.png"), (255, 50, 50)),
-            "hud_heart_empty": (get_path("hud", "hud_heart_empty.png"), (50, 0, 0)),
-            "hud_player":      (get_path("hud", "hud_player.png"), (0, 191, 255))
-        }
+    # ----------------------------
+    # Public API
+    # ----------------------------
+    def render(self, state: Dict[str, Any]) -> None:
+        # Handle window events (so the OS doesn't think the app hung)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+                return
 
-        for name, (path, color) in asset_map.items():
-            if os.path.exists(path):
-                try:
-                    img = pygame.image.load(path).convert_alpha()
-                    # Scale logic
-                    if "hud" in name:
-                        scale = 32
+        grid: np.ndarray = state["grid"]
+        H, W = grid.shape
+        agent_y, agent_x = state["agent_pos"]
+        agent_dir = state.get("agent_dir", DIR_RIGHT)
+        has_key = bool(state.get("has_key", False))
+        step_count = int(state.get("step_count", 0))
+        max_steps = int(state.get("max_steps", 0))
+        score = state.get("score", None)
+
+        # Create/recreate window if size changed (dynamic resolution)
+        if self.screen is None or self._last_grid_shape != (H, W):
+            win_w = W * self.tile_px
+            win_h = H * self.tile_px + self.hud_h
+            self.screen = pygame.display.set_mode((win_w, win_h))
+            pygame.display.set_caption(self.caption)
+            self._last_grid_shape = (H, W)
+
+            # Scale assets to current tile size (reload scaled)
+            self._load_assets(scale=True)
+
+        assert self.screen is not None
+
+        # --- Layer 1: background (void)
+        self.screen.fill((10, 10, 10))
+
+        # --- Layer 2: grid tiles + objects
+        for y in range(H):
+            for x in range(W):
+                tile_id = int(grid[y, x])
+                px = x * self.tile_px
+                py = y * self.tile_px
+
+                if tile_id == VOID:
+                    continue  # void stays background
+                
+                self._blit(self.tiles.get("floor"), px, py, fallback_key="floor", fallback_color=(60, 60, 60))
+
+                # Base floor for any non-void cell
+                if tile_id == FLOOR:
+                    self._blit(self.tiles.get("floor"), px, py, fallback_key="floor", fallback_color=(60, 60, 60))
+                # Overlay objects
+                elif tile_id == START:
+                    self._blit(self.tiles.get("start"), px, py, fallback_key="start", fallback_color=(120, 120, 255))
+                elif tile_id == EXIT:
+                    if has_key:
+                        self._blit(self.tiles.get("exit_unlocked"), px, py, fallback_key="exit_unlocked", fallback_color=(0, 120, 255))
                     else:
-                        scale = TILE_SIZE
-                    
-                    img = pygame.transform.scale(img, (scale, scale))
-                    self.assets[name] = img
-                except Exception as e:
-                    print(f"Error loading {path}: {e}. Using fallback.")
-                    self.assets[name] = self._create_fallback(color)
-            else:
-                # Debug print to help you verify paths
-                print(f"Warning: Asset missing at {path}")
-                self.assets[name] = self._create_fallback(color)
+                        self._blit(self.tiles.get("exit_locked"), px, py, fallback_key="exit_locked", fallback_color=(255, 80, 80))
+                elif tile_id == KEY:
+                    self._blit(self.items.get("key"), px, py, fallback_key="key", fallback_color=(255, 215, 0))
+                elif tile_id == COIN:
+                    self._blit(self.items.get("coin"), px, py, fallback_key="coin", fallback_color=(255, 255, 0))
+                elif tile_id == SPIKE:
+                    self._blit(self.items.get("spike"), px, py, fallback_key="spike", fallback_color=(180, 0, 180))
+                else:
+                    # Unknown tile: show a neutral marker
+                    self._blit(None, px, py, fallback_key="unknown", fallback_color=(0, 0, 0))
 
-    def _create_fallback(self, color, name):
-        """Creates a colored square if image is missing."""
-        surface = pygame.Surface((TILE_SIZE, TILE_SIZE))
-        surface.fill(color)
-        # Add a border to distinguish tiles
-        pygame.draw.rect(surface, (50, 50, 50), surface.get_rect(), 1)
-        return surface
+        # --- Layer 3: agent
+        apx = agent_x * self.tile_px
+        apy = agent_y * self.tile_px
+        sprite = self.player.get(agent_dir)
+        self._blit(sprite, apx, apy, fallback_key=f"player_{agent_dir}", fallback_color=(0, 200, 0))
 
-    def render(self, env):
-        """
-        Main render loop. 
-        Args:
-            env: The KulaWorldEnv instance to read state from.
-        """
-        self.window.fill((10, 10, 10)) # Dark background (Void)
+        # --- Layer 4: HUD
+        self._draw_hud(score=score, step_count=step_count, max_steps=max_steps, has_key=has_key)
 
-        # 1. Draw Grid & Objects
-        for y in range(self.grid_height):
-            for x in range(self.grid_width):
-                cell_id = env.grid[y, x]
-                
-                # Calculate pixel position
-                pos_x = x * TILE_SIZE
-                pos_y = y * TILE_SIZE
-                
-                # Determine what to draw
-                if cell_id != 0: # If not EMPTY/VOID
-                    # Always draw floor first for background of the tile
-                    self.window.blit(self.assets["floor"], (pos_x, pos_y))
-
-                    # Draw objects on top
-                    if cell_id == 3: # START
-                        self.window.blit(self.assets["start"], (pos_x, pos_y))
-                    elif cell_id == 5: # SPIKE
-                        self.window.blit(self.assets["spike"], (pos_x, pos_y))
-                    elif cell_id == 6: # KEY
-                        self.window.blit(self.assets["key"], (pos_x, pos_y))
-                    elif cell_id == 7: # COIN
-                        self.window.blit(self.assets["coin"], (pos_x, pos_y))
-                    elif cell_id == 4: # EXIT
-                        texture = "exit_open" if env.has_key else "exit_locked"
-                        self.window.blit(self.assets[texture], (pos_x, pos_y))
-
-        # 2. Draw Agent
-        agent_y, agent_x = env.agent_pos
-        dy, dx = env.agent_dir
-        
-        # Determine facing sprite
-        if dy == -1: sprite_key = "player_up"
-        elif dy == 1: sprite_key = "player_down"
-        elif dx == -1: sprite_key = "player_left"
-        else: sprite_key = "player_right"
-        
-        self.window.blit(self.assets[sprite_key], (agent_x * TILE_SIZE, agent_y * TILE_SIZE))
-
-        # 3. Draw HUD
-        self._render_hud(env)
-
-        # Update Display
         pygame.display.flip()
-        self.clock.tick(30) # Capped at 30 FPS for smooth rendering
+        self.clock.tick(self.fps)
 
-    def _render_hud(self, env):
-        hud_y = self.grid_height * TILE_SIZE
-        
-        # Draw HUD Background
-        pygame.draw.rect(self.window, (30, 30, 40), (0, hud_y, self.window_width, HUD_HEIGHT))
-        pygame.draw.line(self.window, (255, 255, 255), (0, hud_y), (self.window_width, hud_y), 2)
+    def close(self) -> None:
+        try:
+            pygame.display.quit()
+            pygame.quit()
+        except Exception:
+            pass
+        self.screen = None
 
-        # -- Left: Lives --
-        start_x = 20
-        # Draw 3 hearts (full or empty based on lives)
-        max_lives = 3
-        for i in range(max_lives):
-            heart_type = "hud_heart" if i < env.lives else "hud_heart_empty"
-            self.window.blit(self.assets[heart_type], (start_x + (i * 40), hud_y + 14))
-        
-        # -- Center: Timer --
-        time_left = env.max_time - env.current_time
-        time_color = (255, 255, 255)
-        if time_left < 30: time_color = (255, 50, 50) # Red warning
-        
-        time_surf = self.font.render(f"TIME: {time_left}", True, time_color)
-        time_rect = time_surf.get_rect(center=(self.window_width // 2, hud_y + 30))
-        self.window.blit(time_surf, time_rect)
+    # ----------------------------
+    # Asset loading
+    # ----------------------------
+    def _load_assets(self, scale: bool = False) -> None:
+        """
+        Loads .png assets; missing ones are handled via fallback at blit time.
+        If scale=True, scale loaded surfaces to tile_px.
+        """
+        def load_png(path: str) -> Optional[pygame.Surface]:
+            if not os.path.exists(path):
+                return None
+            try:
+                img = pygame.image.load(path).convert_alpha()
+                if scale:
+                    img = pygame.transform.smoothscale(img, (self.tile_px, self.tile_px))
+                return img
+            except Exception:
+                return None
 
-        # -- Right: Inventory (Key & Score) --
-        # We assume score isn't tracked in Env yet, but we show Key status
-        key_x = self.window_width - 150
-        
-        if env.has_key:
-            self.window.blit(self.assets["key"], (key_x, hud_y + 10))
-            key_text = "COLLECTED"
-            key_col = (255, 215, 0)
-        else:
-            # Draw faded key or text
-            key_text = "NEED KEY"
-            key_col = (150, 150, 150)
-            
-        text_surf = self.font.render(key_text, True, key_col)
-        self.window.blit(text_surf, (key_x + 45, hud_y + 20))
+        # Tiles
+        self.tiles["floor"] = load_png(os.path.join(self.assets_dir, "tiles", "floor.png"))
+        self.tiles["start"] = load_png(os.path.join(self.assets_dir, "tiles", "start.png"))
+        self.tiles["exit_locked"] = load_png(os.path.join(self.assets_dir, "tiles", "exit_locked.png"))
+        self.tiles["exit_unlocked"] = load_png(os.path.join(self.assets_dir, "tiles", "exit_unlocked.png"))
 
-    def close(self):
-        pygame.quit()
+        # Items
+        self.items["coin"] = load_png(os.path.join(self.assets_dir, "items", "coin.png"))
+        self.items["spike"] = load_png(os.path.join(self.assets_dir, "items", "spikes.png"))
+        self.items["key"] = load_png(os.path.join(self.assets_dir, "items", "key.png"))
+
+        # Player (directional)
+        self.player[DIR_UP] = load_png(os.path.join(self.assets_dir, "player", "player_facing_up.png"))
+        self.player[DIR_DOWN] = load_png(os.path.join(self.assets_dir, "player", "player_facing_down.png"))
+        self.player[DIR_LEFT] = load_png(os.path.join(self.assets_dir, "player", "player_facing_left.png"))
+        self.player[DIR_RIGHT] = load_png(os.path.join(self.assets_dir, "player", "player_facing_right.png"))
+
+        # HUD icons (optional; renderer works without them)
+        self.hud["player_icon"] = load_png(os.path.join(self.assets_dir, "hud", "hud_player.png"))
+        self.hud["key_icon"] = load_png(os.path.join(self.assets_dir, "items", "key.png"))
+
+        # If scaling changed, clear fallback cache because sizes changed
+        if scale:
+            self._fallback_cache.clear()
+
+    # ----------------------------
+    # Drawing helpers
+    # ----------------------------
+    def _fallback_surface(self, key: str, color: Tuple[int, int, int]) -> pygame.Surface:
+        cache_key = (key, self.tile_px, self.tile_px)
+        if cache_key in self._fallback_cache:
+            return self._fallback_cache[cache_key]
+        surf = pygame.Surface((self.tile_px, self.tile_px), pygame.SRCALPHA)
+        surf.fill(color)
+        # simple border for visibility
+        pygame.draw.rect(surf, (0, 0, 0), surf.get_rect(), 2)
+        self._fallback_cache[cache_key] = surf
+        return surf
+
+    def _blit(
+        self,
+        surf: Optional[pygame.Surface],
+        x: int,
+        y: int,
+        fallback_key: str,
+        fallback_color: Tuple[int, int, int],
+    ) -> None:
+        assert self.screen is not None
+        if surf is None:
+            surf = self._fallback_surface(fallback_key, fallback_color)
+        self.screen.blit(surf, (x, y))
+
+    def _draw_hud(self, score: Any, step_count: int, max_steps: int, has_key: bool) -> None:
+        assert self.screen is not None
+
+        W_px = self.screen.get_width()
+        H_px = self.screen.get_height()
+
+        hud_y = H_px - self.hud_h
+        hud_rect = pygame.Rect(0, hud_y, W_px, self.hud_h)
+
+        # HUD background
+        pygame.draw.rect(self.screen, (25, 25, 25), hud_rect)
+        pygame.draw.line(self.screen, (60, 60, 60), (0, hud_y), (W_px, hud_y), 2)
+
+        # Left: player icon + score
+        x_left = 10
+        y_mid = hud_y + self.hud_h // 2
+
+        icon = self.hud.get("player_icon")
+        if icon is not None:
+            icon_small = pygame.transform.smoothscale(icon, (32, 32))
+            self.screen.blit(icon_small, (x_left, y_mid - 16))
+            x_left += 40
+
+        score_txt = "Score: -" if score is None else f"Score: {score}"
+        text = self.font.render(score_txt, True, (230, 230, 230))
+        self.screen.blit(text, (x_left, y_mid - text.get_height() // 2))
+
+        # Center: timer (remaining steps)
+        remaining = max(0, max_steps - step_count) if max_steps > 0 else 0
+        timer_color = (230, 230, 230)
+        if remaining < 30:
+            timer_color = (255, 80, 80)
+
+        timer_txt = f"Time: {remaining}"
+        timer_surface = self.font.render(timer_txt, True, timer_color)
+        self.screen.blit(
+            timer_surface,
+            (W_px // 2 - timer_surface.get_width() // 2, y_mid - timer_surface.get_height() // 2),
+        )
+
+        # Right: key status
+        status_txt = "COLLECTED" if has_key else "NEED KEY"
+        status_color = (255, 215, 0) if has_key else (160, 160, 160)
+
+        # optional key icon
+        x_right = W_px - 10
+        key_icon = self.hud.get("key_icon")
+        if key_icon is not None:
+            key_small = pygame.transform.smoothscale(key_icon, (28, 28))
+            x_right -= 28
+            self.screen.blit(key_small, (x_right, y_mid - 14))
+            x_right -= 10
+
+        status_surface = self.font.render(status_txt, True, status_color)
+        x_right -= status_surface.get_width()
+        self.screen.blit(status_surface, (x_right, y_mid - status_surface.get_height() // 2))
