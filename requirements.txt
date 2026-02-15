@@ -16,4 +16,4 @@ sb3-contrib
 tensorboard
 
 # LLM Integration
-# openai
+openai
