@@ -29,18 +29,14 @@ ACTION_ID_TO_NAME = {
 ACTION_NAME_TO_ID = {v: k for k, v in ACTION_ID_TO_NAME.items()}
 
 
-# -----------------------------
-# Tile mapping (from your kula_env)
-# -----------------------------
-# VOID=0, FLOOR=1, START=2, EXIT=4, SPIKE=5, KEY=6, COIN=7
-TILE_ID_TO_CHAR = {
-    0: "_",   # VOID
-    1: ".",   # FLOOR
-    2: "S",   # START
-    4: "E",   # EXIT
-    5: "^",   # SPIKE
-    6: "K",   # KEY
-    7: "C",   # COIN
+CHANNEL_TO_CHAR = {
+    0: "_",  # VOID (visible!)
+    1: ".",  # FLOOR
+    2: "S",  # START
+    3: "E",  # EXIT
+    4: "^",  # SPIKE
+    5: "K",  # KEY
+    6: "C",  # COIN
 }
 
 
@@ -106,7 +102,7 @@ def _local_patch(tile_ids: np.ndarray, agent_y: int, agent_x: int, radius: int =
                 ch = "#"
             else:
                 tid = int(tile_ids[y, x])
-                ch = TILE_ID_TO_CHAR.get(tid, "?")
+                ch = CHANNEL_TO_CHAR.get(tid, "?")
             row_chars.append(ch)
         lines.append("".join(row_chars))
 
@@ -126,33 +122,62 @@ def _valid_actions_from_mask(mask: np.ndarray) -> List[int]:
 
 
 def _parse_action_int(text: str) -> Optional[int]:
-    """
-    Accepts outputs like:
-    - "3"
-    - "Action: 3"
-    - "RIGHT (3)"
-    - "JUMP_RIGHT"
-    """
     if not text:
         return None
 
-    t = text.strip().upper()
+    t = text.strip()
 
-    # direct name
-    if t in ACTION_NAME_TO_ID:
-        return ACTION_NAME_TO_ID[t]
+    # STRICT: must match exactly "ACTION=<digit>"
+    m = re.fullmatch(r"(?i)ACTION\s*=\s*([0-7])", t)
+    if not m:
+        return None
 
-    # name inside text
-    for name, aid in ACTION_NAME_TO_ID.items():
-        if name in t:
-            return aid
+    return int(m.group(1))
 
-    # integer anywhere
-    m = re.search(r"\b([0-7])\b", t)
-    if m:
-        return int(m.group(1))
+def _choose_fallback(valid_actions: List[int], target_vec: Optional[Tuple[int,int,int]]) -> int:
+    # Prefer actions that reduce distance to target using (dy, dx).
+    # If no target, prefer move actions.
+    if not valid_actions:
+        return 0
 
-    return None
+    # Default order preference
+    preferred_moves = [0, 3, 1, 2]  # UP, RIGHT, DOWN, LEFT (example)
+    preferred_jumps = [4, 7, 5, 6]
+
+    if target_vec is None:
+        for a in preferred_moves:
+            if a in valid_actions:
+                return a
+        return valid_actions[0]
+
+    dy, dx, _ = target_vec
+
+    # Choose axis with larger absolute distance (greedy)
+    candidates = []
+    if abs(dx) >= abs(dy):
+        candidates += ([3] if dx > 0 else []) + ([2] if dx < 0 else [])
+        candidates += ([1] if dy > 0 else []) + ([0] if dy < 0 else [])
+    else:
+        candidates += ([1] if dy > 0 else []) + ([0] if dy < 0 else [])
+        candidates += ([3] if dx > 0 else []) + ([2] if dx < 0 else [])
+
+    # prefer move candidates, then jumps in same direction
+    for a in candidates:
+        if a in valid_actions:
+            return a
+
+    # if moves not available, try directional jumps
+    jump_map = {0:4, 1:5, 2:6, 3:7}
+    for a in candidates:
+        ja = jump_map.get(a)
+        if ja is not None and ja in valid_actions:
+            return ja
+
+    # fallback to any move
+    for a in preferred_moves:
+        if a in valid_actions:
+            return a
+    return valid_actions[0]
 
 
 def _stable_cache_key(
@@ -160,16 +185,40 @@ def _stable_cache_key(
     agent_pos: Tuple[int, int],
     patch_lines: List[str],
     valid_actions: List[int],
+    key_vec: Optional[Tuple[int, int, int]],
+    exit_vec: Optional[Tuple[int, int, int]],
 ) -> str:
     payload = {
         "k": bool(has_key),
         "p": [int(agent_pos[0]), int(agent_pos[1])],
         "patch": patch_lines,
         "va": valid_actions,
+        "key": list(key_vec) if key_vec is not None else None,
+        "exit": list(exit_vec) if exit_vec is not None else None,
     }
     s = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def _find_nearest(tile_ids: np.ndarray, src_y: int, src_x: int, targets: List[int]) -> Optional[Tuple[int, int, int]]:
+    """
+    Returns (dy, dx, manhattan_dist) to the nearest target tile id in `targets`.
+    If none exists, returns None.
+    """
+    ys, xs = np.where(np.isin(tile_ids, targets))
+    if len(ys) == 0:
+        return None
+
+    dys = ys.astype(int) - int(src_y)
+    dxs = xs.astype(int) - int(src_x)
+    dists = np.abs(dys) + np.abs(dxs)
+    i = int(np.argmin(dists))
+    dy = int(dys[i])
+    dx = int(dxs[i])
+    dist = int(dists[i])
+    return dy, dx, dist
+
+def _in_local_patch(dy: int, dx: int, radius: int = 2) -> bool:
+    return (-radius <= dy <= radius) and (-radius <= dx <= radius)
 
 def _debug_print(config: DeepSeekConfig, text: str):
     if not config.debug:
@@ -206,7 +255,7 @@ class LLMPolicyAgent:
         obs: Dict[str, Any],
         action_mask: np.ndarray,
         difficulty: int,
-    ) -> Tuple[str, str, str, str]:
+    ) -> Tuple[str, str, str, Any, Any]:
         """
         Returns: (cache_key, system_prompt, user_prompt, debug_patch_text)
         """
@@ -218,73 +267,105 @@ class LLMPolicyAgent:
         tile_ids = _obs_to_tile_ids(grid)
         patch = _local_patch(tile_ids, agent_y, agent_x, radius=2)
 
+        key_vec = _find_nearest(tile_ids, agent_y, agent_x, targets=[5])   # KEY
+        exit_vec = _find_nearest(tile_ids, agent_y, agent_x, targets=[3])  # EXIT
+
+        # If present, also compute if it's inside the 5x5 patch
+        key_in_patch = False
+        exit_in_patch = False
+        if key_vec is not None:
+            key_in_patch = _in_local_patch(key_vec[0], key_vec[1], radius=2)
+        if exit_vec is not None:
+            exit_in_patch = _in_local_patch(exit_vec[0], exit_vec[1], radius=2)
+
+
         valid_actions = _valid_actions_from_mask(action_mask)
         cache_key = _stable_cache_key(
             has_key=has_key,
             agent_pos=(agent_y, agent_x),
             patch_lines=patch,
             valid_actions=valid_actions,
+            key_vec=key_vec,
+            exit_vec=exit_vec,
         )
 
         system_prompt = (
-            "You are a policy for a 2D grid game. Choose the best NEXT action.\n"
-            "The 5x5 view is centered on the agent '@'. Top row is UP (north). Left is LEFT (west).\n"
-            "Symbols: . = floor, _ = void (death), ^ = spike (death), K = key, E = exit, # = out-of-bounds.\n"
-            "Exit only finishes if has_key=1; otherwise E behaves like a normal tile.\n"
-            "Actions:\n"
-            "0=UP, 1=DOWN, 2=LEFT, 3=RIGHT,\n"
-            "4=JUMP_UP, 5=JUMP_DOWN, 6=JUMP_LEFT, 7=JUMP_RIGHT.\n"
-            "A jump moves exactly 2 tiles; ONLY the landing tile matters.\n"
-            "You MUST output ONLY ONE integer that is in allowed_actions. No extra text.\n"
-            "Tie-break: prefer moves (0-3) over jumps (4-7), then choose the smallest action id."
+            "You are a policy for a grid game. Choose the best NEXT action.\n"
+            "Orientation: in view_5x5, first row is UP (north), last row is DOWN (south). "
+            "Left-to-right is LEFT-to-RIGHT (west-to-east). '@' is the agent at the center.\n"
+            "Symbols: . floor, _ void (death), ^ spike (death), K key, E exit, # out-of-bounds.\n"
+            "Exit finishes only if has_key=1; otherwise stepping on E does nothing special.\n"
+            "Actions: 0=UP,1=DOWN,2=LEFT,3=RIGHT,4=JUMP_UP,5=JUMP_DOWN,6=JUMP_LEFT,7=JUMP_RIGHT.\n"
+            "Jump moves exactly 2 tiles; ONLY the landing tile matters.\n"
+            "Global hints: key_rel=(dy,dx) and exit_rel=(dy,dx) give the direction from agent to the target.\n"
+            "Rule: If has_key=0, prioritize moving to the key. If has_key=1, prioritize moving to the exit.\n"
+            "\nOUTPUT FORMAT (MANDATORY): ACTION=<integer>\n"
+            "Example: ACTION=3\n"
+            "No other text."
         )
 
         # local view + allowed actions only
         allowed = ", ".join(str(a) for a in valid_actions)
         patch_txt = "\n".join(patch)
         
+        # format vectors
+        def fmt_vec(v):
+            if v is None:
+                return "none"
+            dy, dx, dist = v
+            return f"(dy={dy}, dx={dx}, dist={dist})"
+
         user_prompt = (
             f"has_key={int(has_key)}\n"
             f"allowed_actions=[{allowed}]\n"
+            f"key_rel={fmt_vec(key_vec)}\n"
+            f"exit_rel={fmt_vec(exit_vec)}\n"
+            f"key_in_view={int(key_in_patch)}\n"
+            f"exit_in_view={int(exit_in_patch)}\n"
             "view_5x5:\n"
             f"{patch_txt}\n"
-            "Goal rule:\n"
-            "- If has_key=0, move toward K if visible.\n"
-            "- If has_key=1, move toward E if visible.\n"
-            "- Otherwise, choose a safe action that increases open floor and avoids '_' and '#'.\n"
-            "Answer: one integer."
+            "\nRemember: output exactly ACTION=<0-7> and nothing else."
         )
 
-        return cache_key, system_prompt, user_prompt, patch_txt
+        return cache_key, system_prompt, user_prompt, key_vec, exit_vec
 
     def act(self, obs: Dict[str, Any], action_mask: np.ndarray, difficulty: int) -> int:
         valid_actions = _valid_actions_from_mask(action_mask)
 
-        # ultimate fallback: if something is weird, pick first valid
         if not valid_actions:
-            return 0
+            return 0  # should never happen, but safe guard
 
-        cache_key, system_prompt, user_prompt, _ = self.build_prompt(obs, action_mask, difficulty)
-        
+        # Build prompt and get state features
+        cache_key, system_prompt, user_prompt, key_vec, exit_vec = self.build_prompt(
+            obs, action_mask, difficulty
+        )
+
         if self.config.debug:
             _debug_print(
                 self.config,
-                f"[CACHE KEY]\n{cache_key}\n\n"
-                f"[SYSTEM PROMPT]\n{system_prompt}\n\n"
-                f"[USER PROMPT]\n{user_prompt}"
+                f"[PROMPT]\n"
+                f"CACHE_KEY={cache_key}\n"
+                f"VALID_ACTIONS={valid_actions}\n"
+                f"HAS_KEY={int(bool(obs['has_key']))}\n"
+                f"TARGET_VEC={exit_vec if bool(obs['has_key']) else key_vec}\n\n"
+                f"[SYSTEM]\n{system_prompt}\n\n"
+                f"[USER]\n{user_prompt}"
             )
 
+        # Choose current target vector
+        has_key = bool(obs["has_key"])
+        target_vec = exit_vec if has_key else key_vec
+
+        # ---- CACHE CHECK ----
         cached = self.cache.get(cache_key)
         if cached is not None and cached in valid_actions:
             if self.config.debug:
-                _debug_print(
-                    self.config,
-                    f"[CACHE HIT] -> Action {cached}"
-                )
+                _debug_print(self.config, f"[CACHE HIT] -> ACTION={cached}")
             return cached
 
-        # Call DeepSeek with retries
-        last_err: Optional[Exception] = None
+        # ---- CALL MODEL ----
+        last_err = None
+
         for attempt in range(self.config.max_retries):
             try:
                 resp = self.client.chat.completions.create(
@@ -297,44 +378,39 @@ class LLMPolicyAgent:
                     max_tokens=self.config.max_tokens,
                     timeout=self.config.timeout_s,
                 )
+
                 text = resp.choices[0].message.content or ""
 
                 if self.config.debug:
-                    _debug_print(
-                        self.config,
-                        f"[RAW LLM OUTPUT]\n{text}"
-                    )
+                    _debug_print(self.config, f"[RAW LLM OUTPUT]\n{text}")
 
                 action = _parse_action_int(text)
 
-                if self.config.debug:
-                    _debug_print(
-                        self.config,
-                        f"[PARSED ACTION]\n{action}\nVALID ACTIONS: {valid_actions}"
-                    )
-
-                if action in valid_actions:
+                # ---- VALID MODEL OUTPUT ----
+                if action is not None and action in valid_actions:
+                    # ✅ cache only real model outputs
                     self.cache.set(cache_key, action)
+
+                    if self.config.debug:
+                        _debug_print(self.config, f"[PARSED VALID ACTION] ACTION={action}")
+
                     return action
 
-                # If invalid, pick a safe fallback among valid actions:
-                # prefer moves 0-3, else any valid.
-                for a in [0, 1, 2, 3]:
-                    if a in valid_actions:
-                        self.cache.set(cache_key, a)
-                        return a
-                self.cache.set(cache_key, valid_actions[0])
-                return valid_actions[0]
+                # ---- INVALID FORMAT OR INVALID ACTION ----
+                if self.config.debug:
+                    _debug_print(self.config, "[INVALID FORMAT OR ACTION] -> using fallback")
+
+                # ❌ DO NOT CACHE fallback
+                return _choose_fallback(valid_actions, target_vec)
 
             except Exception as e:
                 last_err = e
-                # backoff
+                if self.config.debug:
+                    _debug_print(self.config, f"[API ERROR] {e}")
                 time.sleep(self.config.retry_backoff_s * (attempt + 1))
 
-        # If API keeps failing, degrade gracefully
-        if last_err:
-            # prefer moves
-            for a in [0, 1, 2, 3]:
-                if a in valid_actions:
-                    return a
-        return valid_actions[0]
+        # ---- API FAILED AFTER RETRIES ----
+        if self.config.debug and last_err:
+            _debug_print(self.config, "[API FAILED] -> fallback")
+
+        return _choose_fallback(valid_actions, target_vec)
